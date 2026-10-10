@@ -25,6 +25,7 @@ from cubifyanything.color import random_color
 from cubifyanything.cubify_transformer import make_cubify_transformer
 from cubifyanything.dataset import CubifyAnythingDataset
 from cubifyanything.instances import Instances3D
+from cubifyanything.image_export import save_prediction_image
 from cubifyanything.preprocessor import Augmentor, Preprocessor
 
 def move_device_like(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
@@ -198,7 +199,8 @@ def unproject(depth, K, RT, max_depth=10.0):
 
     return world_xyz.T[..., :-1].reshape(uvd.shape[0], uvd.shape[1], 3), valid
 
-def load_data_and_execute_model(model, dataset, augmentor, preprocessor, score_thresh=0.0, viz_on_gt_points=False):
+def load_data_and_execute_model(model, dataset, augmentor, preprocessor, score_thresh=0.0, viz_on_gt_points=False,
+                                image_output_dir=None, image_format="png", image_only=False):
     is_depth_model = "wide/depth" in augmentor.measurement_keys
     blueprint = rrb.Blueprint(
         rrb.Vertical(
@@ -232,9 +234,9 @@ def load_data_and_execute_model(model, dataset, augmentor, preprocessor, score_t
     video_id = None
 
     device = model.pixel_mean
-    for sample in dataset:
+    for frame_index, sample in enumerate(dataset):
         sample_video_id = sample["meta"]["video_id"]
-        if (recording is None) or (video_id != sample_video_id):
+        if not image_only and ((recording is None) or (video_id != sample_video_id)):
             new_recording = rerun.new_recording(
                 application_id=str(sample_video_id), recording_id=uuid.uuid4(), make_default=True)
             new_recording.send_blueprint(blueprint, make_active=True)
@@ -246,20 +248,21 @@ def load_data_and_execute_model(model, dataset, augmentor, preprocessor, score_t
             # Keep things in image space, so adjust accordingly.
             rerun.log("/world", rerun.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True) 
 
-        rerun.set_time_seconds("pts", sample["meta"]["timestamp"], recording=recording)
+        if not image_only:
+            rerun.set_time_seconds("pts", sample["meta"]["timestamp"], recording=recording)
 
         # -> channels last.
         image = np.moveaxis(sample["wide"]["image"][-1].numpy(), 0, -1)        
         color_camera = rerun.Pinhole(
             image_from_camera=sample["sensor_info"].wide.image.K[-1].numpy(), resolution=sample["sensor_info"].wide.image.size)
 
-        if is_depth_model:
+        if is_depth_model and not image_only:
             # Show the depth being sent to the model.            
             depth_camera = rerun.Pinhole(
                 image_from_camera=sample["sensor_info"].wide.depth.K[-1].numpy(), resolution=sample["sensor_info"].wide.depth.size)
 
         xyzrgb = None
-        if viz_on_gt_points and sample["sensor_info"].has("gt"):
+        if not image_only and viz_on_gt_points and sample["sensor_info"].has("gt"):
             # Backproject GT depth to world so we can compare our predictions.
             depth_gt = sample["gt"]["depth"][-1]
             matched_image = torch.tensor(np.array(Image.fromarray(image).resize((depth_gt.shape[1], depth_gt.shape[0]))))
@@ -276,6 +279,16 @@ def load_data_and_execute_model(model, dataset, augmentor, preprocessor, score_t
             pred_instances = model(packaged)[0]
 
         pred_instances = pred_instances[pred_instances.scores >= score_thresh]
+
+        if image_output_dir is not None:
+            output_path = save_prediction_image(
+                image, pred_instances, sample["sensor_info"].wide.image.K[-1],
+                image_output_dir, sample_video_id, sample["meta"]["timestamp"],
+                frame_index, image_format=image_format)
+            print(f"Saved annotated image: {output_path}", flush=True)
+
+        if image_only:
+            continue
         
         # Hold off on logging anything until now, since the delay might confuse the user in the visualizer.
         rerun.log("/device/wide/image", rerun.Image(image).compress())
@@ -296,14 +309,26 @@ if __name__ == "__main__":
     parser.add_argument("dataset_path", help="Path to the directory containing the .tar files, the full path to a single tar file (recommended), or a path to a txt file containing HTTP links. Using the value \"stream\" will attempt to stream from your device using the NeRFCapture app")
     parser.add_argument("--model-path", help="Path to the model to load")
     parser.add_argument("--no-depth", default=False, action="store_true", help="Skip loading depth.")
-    parser.add_argument("--score-thresh", default=0.25, help="Threshold for detections")
+    parser.add_argument("--score-thresh", default=0.25, type=float, help="Threshold for detections")
     parser.add_argument("--every-nth-frame", default=None, type=int, help="Load every `n` frames")
+    parser.add_argument("--max-frames", type=int, help="Maximum number of sampled frames to process")
+    parser.add_argument("--image-output-dir", type=Path, help="Save annotated RGB frames under this directory")
+    parser.add_argument("--image-format", choices=("png", "jpg"), default="png", help="Annotated image format (default: png)")
+    parser.add_argument("--image-only", action="store_true", help="Export images without starting or logging to Rerun")
     parser.add_argument("--viz-only", default=False, action="store_true", help="Skip loading a model and only visualize data.")
     parser.add_argument("--viz-on-gt-points", default=False, action="store_true", help="Backproject the GT depth to form a point cloud in order to visualize the predictions")
     parser.add_argument("--device", default="cpu", help="Which device to push the model to (cpu, mps, cuda)")
     parser.add_argument("--video-ids", nargs="+", help="Subset of videos to execute on. By default, all. Ignored if a tar file is explicitly given or in stream mode.")
 
     args = parser.parse_args()
+    if args.image_only and args.image_output_dir is None:
+        parser.error("--image-only requires --image-output-dir")
+    if args.viz_only and (args.image_output_dir is not None or args.image_only):
+        parser.error("image export requires model inference; remove --viz-only")
+    if args.max_frames is not None and args.max_frames < 1:
+        parser.error("--max-frames must be positive")
+    if args.every_nth_frame is not None and args.every_nth_frame < 1:
+        parser.error("--every-nth-frame must be positive")
     print("Command Line Args:", args)
 
     dataset_path = args.dataset_path
@@ -346,6 +371,8 @@ if __name__ == "__main__":
     if args.viz_only:
         if args.every_nth_frame is not None:
             dataset = itertools.islice(dataset, 0, None, args.every_nth_frame)
+        if args.max_frames is not None:
+            dataset = itertools.islice(dataset, args.max_frames)
         
         load_data_and_visualize(dataset)
         sys.exit(0)
@@ -368,6 +395,8 @@ if __name__ == "__main__":
     dataset.load_arkit_depth = is_depth_model
     if args.every_nth_frame is not None:
         dataset = itertools.islice(dataset, 0, None, args.every_nth_frame)
+    if args.max_frames is not None:
+        dataset = itertools.islice(dataset, args.max_frames)
 
     augmentor = Augmentor(("wide/image", "wide/depth") if is_depth_model else ("wide/image",))
     preprocessor = Preprocessor()
@@ -375,4 +404,7 @@ if __name__ == "__main__":
     if args.device is not None:
         model = model.to(args.device)
 
-    load_data_and_execute_model(model, dataset, augmentor, preprocessor, score_thresh=args.score_thresh, viz_on_gt_points=args.viz_on_gt_points)
+    load_data_and_execute_model(
+        model, dataset, augmentor, preprocessor, score_thresh=args.score_thresh,
+        viz_on_gt_points=args.viz_on_gt_points, image_output_dir=args.image_output_dir,
+        image_format=args.image_format, image_only=args.image_only)

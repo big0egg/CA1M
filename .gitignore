@@ -1,0 +1,35 @@
+# Model weights and checkpoints stay local.
+/models/
+/weights/
+/checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# Downloaded/extracted datasets; retain the official URL lists and license.
+/data/*
+!/data/train.txt
+!/data/val.txt
+!/data/LICENSE_DATA
+!/data/cavqa/
+/data/cavqa/*
+!/data/cavqa/val.txt
+!/data/cavqa/train_*.txt
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Generated images, recordings, and environment artifacts.
+/outputs/
+*.rrd
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+/.venv/
+/venvs/
+/.cache/
